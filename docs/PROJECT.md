@@ -164,6 +164,8 @@ GitLogAiEngine/
 │   ├── models/
 │   │   ├── ChangelogCache.js
 │   │   └── UserRateLimit.js
+│   ├── errors/
+│   │   └── AppError.js               # typed error hierarchy (§12)
 │   ├── routes/
 │   │   └── generate.js               # POST /api/generate — thin, delegates to orchestrator
 │   ├── orchestrator/
@@ -188,9 +190,12 @@ GitLogAiEngine/
 │   │   │   └── render.js
 │   │   └── index.js                  # { freelancer, company } lookup map
 │   ├── middleware/
-│   │   ├── asyncHandler.js
-│   │   ├── rateLimiter.js
-│   │   └── errorHandler.js
+│   │   ├── asyncHandler.js           # catches rejected promises, forwards to errorHandler
+│   │   ├── rateLimiter.js            # per-IP monthly cap (§13)
+│   │   └── errorHandler.js           # centralized Express error middleware (§12)
+│   ├── scripts/
+│   │   ├── verify-models.js          # throwaway DB verification (Phase 1)
+│   │   └── benchmark.js              # manual latency benchmark, cache-hit vs cache-miss (§14)
 │   ├── server.js
 │   ├── .env.example
 │   └── package.json
@@ -198,9 +203,10 @@ GitLogAiEngine/
     ├── src/
     │   ├── components/
     │   │   ├── Dashboard.jsx       # container: owns state + API calls
-    │   │   └── RenderMarkdown.jsx  # presentational: markdown output + download
+    │   │   ├── RenderMarkdown.jsx  # presentational: markdown output + download
+    │   │   └── ErrorBoundary.jsx   # catches render-time crashes (§15)
     │   ├── api/
-    │   │   └── client.js           # fetch wrapper for backend API
+    │   │   └── client.js           # fetch wrapper, AbortController timeout (§15)
     │   ├── App.jsx
     │   └── main.jsx
     ├── index.html
@@ -213,7 +219,7 @@ MongoDB runs in Docker via Compose — nobody installs or manages a local Mongo
 process by hand. The backend and frontend Node processes still run directly
 on the host (not containerized) for fast hot-reload during development;
 containerizing the app itself is a deploy-time concern, not a dev-time one
-(see §14 Out of Scope / Phase 14 in `PHASES.md`).
+(see §18 Out of Scope / Phase 17 in `PHASES.md`).
 
 `docker-compose.yml` (repo root):
 ```yaml
@@ -467,7 +473,164 @@ token truncation:
   keeps every group the model sees fully coherent, which is also what makes
   grounding checks reliable (partial context produces unreliable claims).
 
-## 12. Implementation Guardrails
+## 12. Error Handling & Graceful Failure
+
+Design goal: no unhandled error should ever crash the process, and every
+failure — expected or not — surfaces as a predictable, typed response. This
+extends the hexagonal boundary rule (§2) to errors: a caller should never
+have to know whether a failure came from Octokit, LangChain, or Mongoose.
+
+**Typed error hierarchy** (`backend/errors/AppError.js`):
+```
+AppError (base, extends Error)     — { code, statusCode, message }
+├── ValidationError                — 400, bad request shape
+├── NotFoundError                  — 404, repo/commits not found
+├── SchemaValidationError          — 422, LLM output failed schema twice
+├── RateLimitError                 — 429, monthly cap exceeded
+└── UpstreamError                  — 502, GitHub/Gemini failed or timed out
+```
+Adapters (`github.adapter.js`, `gemini.adapter.js`) catch whatever their
+underlying library throws and rethrow one of these — nothing outside
+`adapters/` ever sees a raw Octokit or LangChain error type.
+
+**`middleware/asyncHandler.js`** — wraps every async route handler so a
+rejected promise is forwarded to `next(err)` instead of becoming an
+unhandled rejection. Without this, a thrown error inside an `async` Express
+handler is silently swallowed (Express 4) or crashes the process (Express 5
+in some cases) rather than reaching the error handler.
+
+**`middleware/errorHandler.js`** — the single centralized Express
+error-handling middleware (4-arg signature, registered last). Known
+`AppError` subclasses map directly to their `statusCode` and a client-safe
+`{ error: { code, message } }` body. Anything else (a genuine bug) is logged
+server-side with full stack trace but returned to the client as a generic
+`500` — stack traces and internals never leak into a response.
+
+**Per-adapter timeouts** — `github.adapter.js` and `gemini.adapter.js` wrap
+their external calls in a timeout (`Promise.race` against a
+`setTimeout(ADAPTER_TIMEOUT_MS)`). Without this, a hung GitHub or Gemini call
+holds the request (and the client's loading state) open indefinitely. A
+timeout is rethrown as `UpstreamError`, same as any other upstream failure.
+
+**Process-level safety nets** (outside Express entirely, in `server.js`):
+```js
+process.on('unhandledRejection', (err) => { /* log, then exit(1) */ });
+process.on('uncaughtException', (err) => { /* log, then exit(1) */ });
+```
+These catch bugs that escape `asyncHandler` entirely — e.g. an error thrown
+in a timer callback or a library's background task. Policy is fail fast:
+log with full context and exit, rather than keep serving requests from a
+process that might be in a corrupted state. Docker (`restart: unless-stopped`
+in the eventual deploy compose file) brings it back up clean.
+
+**Graceful shutdown** — on `SIGTERM`/`SIGINT` (sent by Docker on
+stop/restart, or Ctrl+C locally): stop accepting new connections
+(`server.close()`), let in-flight requests finish up to
+`SHUTDOWN_TIMEOUT_MS`, then close the Mongoose connection, then exit. Without
+this, a deploy or container restart can drop in-flight requests and leave
+Mongo connections dangling.
+
+## 13. Rate Limiting
+
+Purpose: this is a free/cheap-tier public tool sitting in front of two paid
+APIs (GitHub, Gemini) — without a cap, a handful of scripted requests could
+exhaust quota or run up real cost.
+
+**Strategy** — fixed monthly window per IP, tracked in `UserRateLimit` (§7:
+`userIpAddress`, `requestCountWithinMonth`, `lastRequestTimestamp`).
+
+**Reset logic** — on each request: if `lastRequestTimestamp`'s calendar
+month differs from the current month, reset the counter to 1; otherwise
+increment it. This must be a single atomic `findOneAndUpdate` with `$inc`
+(and `upsert: true` for a first-ever request from an IP) — not a
+read-then-write — otherwise two concurrent requests from the same IP can
+both read `count = N` and both write `N + 1`, silently losing an increment
+and under-counting real usage.
+
+**Enforcement** — `middleware/rateLimiter.js` runs before the route handler,
+delegates the atomic check/increment to `cache.repository.js` (keeping raw
+Mongoose calls out of the middleware, consistent with the Repository
+pattern), and throws `RateLimitError` once `requestCountWithinMonth` exceeds
+`MAX_REQUESTS_PER_MONTH`.
+
+**Response shape** — a `429` includes when the window resets (first of next
+month) in the body, and sets the standard `Retry-After` header (RFC 9110) so
+well-behaved clients — including this project's own frontend (§15) — know
+when to stop retrying instead of hammering the endpoint.
+
+**Trust proxy (deploy-time note)** — once this runs behind a reverse
+proxy/load balancer, `req.ip` resolves to the proxy's address for every user
+unless Express's `app.set('trust proxy', ...)` is configured correctly,
+which would silently rate-limit all users as one IP. Flagged here so it
+isn't forgotten when Phase 17 (deploy readiness) happens.
+
+## 14. Benchmarking & Performance Instrumentation
+
+Two distinct mechanisms, for two different questions:
+
+**1. Per-stage timing instrumentation (always on)** — `generate.orchestrator.js`
+records a timestamp before/after each pipeline stage and logs a structured
+breakdown per request:
+```json
+{
+  "requestId": "…", "cached": false,
+  "stages": { "extraction": 420, "grouping": 8, "prioritization": 3,
+              "llm": 1830, "grounding": 12, "render": 2 },
+  "totalMs": 2275
+}
+```
+This answers *"why is this request slow"* — the LLM call is expected to
+dominate (seconds), while every pure pipeline stage should stay in
+single-digit milliseconds. That gap is itself a useful sanity check: if a
+"pure" service ever shows up slow, something's wrong (e.g. accidental I/O
+leaking into a stage that's supposed to be a pure function per §2).
+
+**2. Standalone benchmark script** (`backend/scripts/benchmark.js`, run
+manually — not part of the app or CI) — hits `POST /api/generate`
+repeatedly against a few real repos and reports p50/p95/p99 latency
+separately for cache-miss and cache-hit paths. This is what actually proves
+the cache (§7, §8) is doing its job: a hit should be milliseconds, a miss
+should be several seconds dominated by the Gemini call. Re-run it after any
+pipeline change (new grounding rule, bigger prompt, etc.) to catch
+regressions — there's no fixed performance budget enforced automatically,
+this is a manual dev tool, not a CI gate.
+
+**Why not a load-testing tool (k6/autocannon) for v1** — the bottleneck here
+is a single external LLM call's latency, not server throughput under
+concurrency. A simple sequential script measuring wall-clock time across N
+real requests answers the actual question ("how slow is this for one user")
+more directly than a tool built to measure capacity under concurrent load,
+which isn't this project's constraint at this stage.
+
+## 15. Frontend Resilience
+
+The "zero-willpower UI" guardrail (§16) covers expected states
+(idle/loading/success/error). These five items cover what happens when
+something goes *unexpectedly* wrong, or takes *too long*:
+
+- **Error boundary** — a React `ErrorBoundary` component (in
+  `frontend/src/components/ErrorBoundary.jsx`) wraps `<Dashboard />` in
+  `App.jsx`, catching render-time JS exceptions (e.g. a markdown edge case
+  crashing `react-markdown`) and showing a fallback message instead of a
+  blank white screen. A crash is still a failure state the UI must handle
+  gracefully, not just a network error.
+- **Request timeout / abort** — `api/client.js` uses `AbortController` with
+  a client-side timeout (longer than the expected worst-case Gemini latency,
+  but not infinite) so a hung backend can't leave the UI stuck in `loading`
+  forever. A timeout surfaces its own distinct "timed out, try again" state
+  rather than the generic upstream-failure message.
+- **Retry affordance** — the `error` state in `Dashboard.jsx` always renders
+  a "Try again" action that re-submits the same request, instead of
+  requiring a full page reload. Most useful for transient `502`s.
+- **Rate-limit UX** — a `429` is shown distinctly from other errors, using
+  the backend's reset-date info (§13) to tell the user specifically when
+  they can try again, instead of a generic "something went wrong."
+- **Perf-aware loading state** — since a cache-miss generation can take
+  several seconds (per §14's real benchmark numbers), the loading state
+  shows a "this can take up to ~X seconds" hint instead of a bare spinner
+  with no context, so the user doesn't assume the app has frozen.
+
+## 16. Implementation Guardrails
 
 - **Zero-willpower UI** — every async action in the frontend has explicit
   loading / error / success states. No silent spinners with unclear outcomes.
@@ -497,7 +660,7 @@ token truncation:
 - **Idempotent generation** — the same `(repo, sha, mode)` triple always
   returns the same cached markdown until the cache entry expires (30-day TTL).
 
-## 13. Environment Variables (backend)
+## 17. Environment Variables (backend)
 
 ```
 PORT=4000
@@ -508,9 +671,12 @@ MAX_INPUT_TOKENS=6000
 MAX_OUTPUT_TOKENS=2000
 COMMIT_FETCH_LIMIT=20
 GROUNDING_MIN_OVERLAP=0.2
+MAX_REQUESTS_PER_MONTH=100
+ADAPTER_TIMEOUT_MS=15000
+SHUTDOWN_TIMEOUT_MS=10000
 ```
 
-## 14. Out of Scope (v1)
+## 18. Out of Scope (v1)
 
 - User accounts / auth (rate limiting is IP-based only for now)
 - Private repo support (requires OAuth app, not just a PAT)
@@ -518,7 +684,7 @@ GROUNDING_MIN_OVERLAP=0.2
 - Editing/regenerating a single section of the markdown output
 - Second-pass LLM-based grounding verification (v1 grounding is heuristic/lexical only)
 
-## 15. References
+## 19. References
 
 - Hohpe, G. & Woolf, B. — *Enterprise Integration Patterns* (2003). Source of
   the Pipes-and-Filters pattern used for the core pipeline.
