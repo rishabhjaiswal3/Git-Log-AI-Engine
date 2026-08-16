@@ -10,9 +10,11 @@ import Octokit, LangChain, or Mongoose. Everything in `services/` and
 Keep that boundary honest phase by phase — it's what makes each phase
 independently testable.
 
+**Status:** Phases 0–2 complete. Phase 3 (Rate Limiting) is next.
+
 ---
 
-## Phase 0 — Repo Scaffolding
+## Phase 0 — Repo Scaffolding ✅
 
 **Goal:** empty-but-runnable skeleton, no business logic yet.
 
@@ -31,7 +33,7 @@ responds; no unused deps.
 
 ---
 
-## Phase 1 — Database Layer + Docker Compose
+## Phase 1 — Database Layer + Docker Compose ✅
 
 **Goal:** MongoDB running via Docker Compose, connection + schemas wired up,
 no routes consuming them yet.
@@ -47,8 +49,10 @@ no routes consuming them yet.
   `droppedItems` fields) and `backend/models/UserRateLimit.js`, exactly as
   specified in `PROJECT.md` §7.
 - Connect `db.js` in `server.js` at boot, fail loudly if connection fails.
+- `backend/config/env.js` — the only file that reads `process.env`, exports
+  every value as a `SCREAMING_SNAKE_CASE` constant (`PROJECT.md` §16).
 - Note: `models/` holds schema definitions only. Nothing queries them yet —
-  that's `adapters/cache.repository.js` in Phase 9, keeping Mongoose calls
+  that's `adapters/cache.repository.js` in Phase 11, keeping Mongoose calls
   out of routes/services from day one.
 
 **Review checkpoint:**
@@ -65,7 +69,75 @@ no routes consuming them yet.
 
 ---
 
-## Phase 2 — GitHub Extraction Adapter
+## Phase 2 — Error Handling Foundation ✅
+
+**Goal:** every failure mode in `PROJECT.md` §12 wired up *before* any
+adapter exists, so every adapter written from here on throws typed errors
+from day one instead of leaking raw library errors.
+
+- `backend/errors/AppError.js` — base `AppError` class plus
+  `ValidationError` (400), `NotFoundError` (404), `SchemaValidationError`
+  (422), `RateLimitError` (429), `UpstreamError` (502).
+- `backend/middleware/asyncHandler.js` — wraps async route handlers so
+  rejected promises reach Express's error handler instead of being
+  swallowed or crashing the process.
+- `backend/middleware/errorHandler.js` — centralized 4-arg error middleware:
+  known `AppError`s map to their status + `{ error: { code, message } }`;
+  anything else logs full detail server-side and returns a generic `500`.
+- `server.js`: register `errorHandler` last, add
+  `process.on('unhandledRejection', ...)` / `process.on('uncaughtException', ...)`
+  (log + `process.exit(1)` — fail fast, let the process manager restart
+  clean), and graceful shutdown on `SIGTERM`/`SIGINT` (stop accepting new
+  connections, drain in-flight requests up to `SHUTDOWN_TIMEOUT_MS`, close
+  the Mongo connection, then exit).
+- New env vars: `SHUTDOWN_TIMEOUT_MS`, `ADAPTER_TIMEOUT_MS` (the latter isn't
+  used until Phase 4's adapter exists, but belongs in `env.js` now so every
+  future adapter can just import it).
+
+**Review checkpoint:**
+1. Add a temporary route that throws each `AppError` subclass — confirm each
+   returns the right status code and a clean JSON body, with no stack trace
+   leaking to the client.
+2. Add a temporary route that throws a plain `Error` — confirm it logs the
+   full stack server-side and still returns a generic `500`, not a crash.
+3. Send `SIGTERM` to the running dev server mid-request — confirm the
+   in-flight request completes before the process exits, and Mongo
+   disconnects cleanly (no dangling-connection warning).
+4. Remove the temporary test route before merging.
+
+---
+
+## Phase 3 — Rate Limiting
+
+**Goal:** protect the pipeline from abuse. Moved ahead of the adapters/route
+work (it only depends on Phase 1's `UserRateLimit` model and Phase 2's
+`RateLimitError`) so it's in place before there's a real endpoint to abuse.
+
+- `backend/adapters/cache.repository.js` gains
+  `checkAndIncrementRateLimit(ip)`: a single atomic
+  `findOneAndUpdate` with `$inc` (and `upsert: true`) against
+  `UserRateLimit` — never read-then-write, which would race under
+  concurrent requests from the same IP. Resets `requestCountWithinMonth` to
+  1 when `lastRequestTimestamp` falls in a previous calendar month.
+- `backend/middleware/rateLimiter.js` — calls the above, throws
+  `RateLimitError` once `requestCountWithinMonth > MAX_REQUESTS_PER_MONTH`.
+  Sets the `Retry-After` header (RFC 9110) on the 429 response.
+- New env var: `MAX_REQUESTS_PER_MONTH`.
+- Note (deploy-time, not needed yet): once behind a reverse proxy, Express's
+  `trust proxy` setting must be configured or every user shares one IP —
+  tracked for Phase 17.
+
+**Review checkpoint:** unit test `checkAndIncrementRateLimit` directly
+against the Compose Mongo — fire concurrent calls for the same IP and
+confirm the final count matches the number of calls exactly (proves the
+atomic increment, not a race). Wire the middleware onto the existing
+`/api/health` route temporarily to confirm the 429 + `Retry-After` path
+works end-to-end, then remove that temporary wiring (it belongs on
+`/api/generate` starting Phase 11).
+
+---
+
+## Phase 4 — GitHub Extraction Adapter
 
 **Goal:** given `owner/repo`, return a rich, filtered dataset — not just bare
 commit messages. No grouping, no LLM, no route yet — exercised by a script.
@@ -73,6 +145,9 @@ commit messages. No grouping, no LLM, no route yet — exercised by a script.
 - `backend/adapters/github.adapter.js` using `@octokit/rest`, authenticated
   via `GITHUB_TOKEN`. This is the only file in the project allowed to import
   Octokit.
+- Wrap every Octokit call with the `ADAPTER_TIMEOUT_MS` timeout from Phase 2
+  and catch/rethrow failures as `NotFoundError` or `UpstreamError` — never
+  let a raw Octokit error escape this file.
 - Fetch the last `COMMIT_FETCH_LIMIT` commits.
 - For each commit, resolve its associated merged PR (if any) and pull the
   PR's **title and description**.
@@ -91,22 +166,24 @@ commit messages. No grouping, no LLM, no route yet — exercised by a script.
                deletions: number, patchExcerpt: string }]
   }[]
   ```
-- Handle repo-not-found and empty-commit-history as explicit errors, not
-  silent empty arrays.
+- Handle repo-not-found and empty-commit-history as explicit `NotFoundError`s,
+  not silent empty arrays.
 
 **Review checkpoint:** run against 2-3 real public repos (pick at least one
 with PR-linked commits), confirm PR titles/descriptions resolve correctly,
-diff excerpts are short and readable, and filtering behaves.
+diff excerpts are short and readable, filtering behaves, and a deliberately
+bad repo name produces a clean `NotFoundError` rather than an Octokit
+stack trace.
 
 ---
 
-## Phase 3 — Commit Grouping (Pure Service)
+## Phase 5 — Commit Grouping (Pure Service)
 
 **Goal:** cluster related commits/PRs into logical units before anything is
-sent downstream. Pure function, tested with fixture data from Phase 2 — no
+sent downstream. Pure function, tested with fixture data from Phase 4 — no
 network calls in this phase at all.
 
-- `backend/services/grouping.service.js` — takes the array from Phase 2,
+- `backend/services/grouping.service.js` — takes the array from Phase 4,
   returns grouped units. No imports from `adapters/`.
 - Rule 1: commits sharing the same merged PR are always one group.
 - Rule 2: remaining ungrouped commits are clustered by overlapping changed
@@ -122,7 +199,7 @@ and no commit is silently dropped or duplicated across groups.
 
 ---
 
-## Phase 4 — Commit-Aware Prioritization (Pure Service)
+## Phase 6 — Commit-Aware Prioritization (Pure Service)
 
 **Goal:** replace naive token truncation with priority-ranked group
 selection that fits the token budget.
@@ -130,7 +207,7 @@ selection that fits the token budget.
 - `backend/services/prioritization.service.js`, using `js-tiktoken` to
   measure running size (not to truncate mid-text). Pure function — takes
   groups + a token budget, returns the surviving subset.
-- Score each group from Phase 3 by: PR linkage, commit-type weight (`feat` >
+- Score each group from Phase 5 by: PR linkage, commit-type weight (`feat` >
   `fix` > `refactor` > `chore`/`docs`/`test`), number of files touched,
   recency.
 - Pack groups into `MAX_INPUT_TOKENS` highest-score first. A group that
@@ -143,7 +220,7 @@ token count stays under budget.
 
 ---
 
-## Phase 5 — Mode Registry + Structured Output Schemas
+## Phase 7 — Mode Registry + Structured Output Schemas
 
 **Goal:** stand up the `modes/` strategy folders — prompt + schema per mode
 — before wiring the actual LLM call.
@@ -162,27 +239,28 @@ shapes.
 
 ---
 
-## Phase 6 — Gemini Adapter (Structured JSON)
+## Phase 8 — Gemini Adapter (Structured JSON)
 
 **Goal:** wire LangChain + Gemini 1.5 Flash to return validated JSON, not
 free-text markdown.
 
 - `backend/adapters/gemini.adapter.js` — `generateStructured(groups, mode)`:
   looks up the prompt/schema via `modes/index.js`, calls Gemini via
-  LangChain, parses the response as JSON, validates against the mode's zod
-  schema. On validation failure, retry once with an explicit "your last
-  response was invalid JSON" repair prompt; on second failure, throw a typed
-  schema error (maps to `422`). This is the only file allowed to import
-  LangChain/the Gemini client.
+  LangChain (wrapped with `ADAPTER_TIMEOUT_MS` from Phase 2), parses the
+  response as JSON, validates against the mode's zod schema. On validation
+  failure, retry once with an explicit "your last response was invalid
+  JSON" repair prompt; on second failure, throw `SchemaValidationError`
+  (422). Any network/timeout failure throws `UpstreamError` (502). This is
+  the only file allowed to import LangChain/the Gemini client.
 
-**Review checkpoint:** manually run both modes against Phase 4's output for a
+**Review checkpoint:** manually run both modes against Phase 6's output for a
 small real repo, confirm the returned JSON always validates against the
 schema, and deliberately break the model's response once (e.g. via a bad
 prompt tweak) to confirm the retry-then-fail path works.
 
 ---
 
-## Phase 7 — Factual-Grounding Checks (Pure Service)
+## Phase 9 — Factual-Grounding Checks (Pure Service)
 
 **Goal:** verify the LLM's JSON claims against source data before anything
 is rendered.
@@ -197,9 +275,9 @@ is rendered.
      count; trim lowest-confidence excess items first.
   - Returns `{ verified: <filtered json>, dropped: string[] }` (dropped
     reasons logged, never shown to the client).
-  - If a required section ends up empty after filtering, throw a typed error
-    (maps to `502` at the route level — don't render a misleadingly sparse
-    changelog).
+  - If a required section ends up empty after filtering, throw
+    `UpstreamError` (502 at the route level) — don't render a misleadingly
+    sparse changelog.
 
 **Review checkpoint:** unit test with a fixture JSON response that includes
 one deliberately-invented item (fake SHA) and one deliberately-unrelated
@@ -208,7 +286,7 @@ legitimate items survive.
 
 ---
 
-## Phase 8 — Markdown Rendering (Pure Service, Per-Mode)
+## Phase 10 — Markdown Rendering (Pure Service, Per-Mode)
 
 **Goal:** deterministic JSON → Markdown, so the model never controls
 formatting.
@@ -225,46 +303,53 @@ byte-diff the output against the expected template structure.
 
 ---
 
-## Phase 9 — Cache Repository + `/api/generate` Route (End-to-End)
+## Phase 11 — Cache Repository + `/api/generate` Route (End-to-End)
 
-**Goal:** wire everything together behind the real API contract, including
-caching this time (folded in here since the orchestrator needs the
-repository either way).
+**Goal:** wire everything together behind the real API contract — extraction
+through rendering, plus caching and the rate limiter built in Phase 3.
 
-- `backend/adapters/cache.repository.js` — `getCached()` / `saveResult()`,
-  the only file allowed to call `ChangelogCache`/`UserRateLimit` Mongoose
-  methods directly.
+- `backend/adapters/cache.repository.js` — add `getCached()` / `saveResult()`
+  alongside the rate-limit methods from Phase 3. This remains the only file
+  allowed to call `ChangelogCache`/`UserRateLimit` Mongoose methods directly.
 - `backend/orchestrator/generate.orchestrator.js` — runs cache-check →
   extraction → grouping → prioritization → llm → grounding → render → cache
   write, in sequence. Contains no business logic itself, only wiring.
-- `backend/routes/generate.js` — validates `{ owner, repo, mode }`, calls the
-  orchestrator, returns the contract shape from `PROJECT.md` §8.
-- `backend/middleware/asyncHandler.js` + `errorHandler.js` — central error
-  capture, consistent JSON error shape, correct status codes
-  (400/404/422/429/502).
+- `backend/routes/generate.js` — wraps the handler in `asyncHandler`
+  (Phase 2), applies `rateLimiter` (Phase 3), validates
+  `{ owner, repo, mode }` (throws `ValidationError` on a bad shape), calls
+  the orchestrator, returns the contract shape from `PROJECT.md` §8.
+- Wire `errorHandler` (Phase 2) as Express's last middleware if not already
+  done.
 
 **Review checkpoint:** hit the route with curl/Postman for both modes on a
 couple of real repos, confirm response shape and error codes match the
-contract exactly, spot-check rendered markdown reads well, then call the
-same repo/mode twice — the second call must be near-instant and marked
-`cached: true`.
+contract exactly (400/404/422/429/502 all reachable), spot-check rendered
+markdown reads well, then call the same repo/mode twice — the second call
+must be near-instant and marked `cached: true`.
 
 ---
 
-## Phase 10 — Rate Limiting
+## Phase 12 — Benchmarking & Performance Instrumentation
 
-**Goal:** protect the pipeline from abuse now that it's fully wired.
+**Goal:** know exactly where request time goes, and have a repeatable way to
+measure regressions, per `PROJECT.md` §14.
 
-- `backend/middleware/rateLimiter.js` using `UserRateLimit` (via
-  `cache.repository.js`, not direct Mongoose calls): reject with 429 once an
-  IP exceeds the configured monthly request count.
+- `generate.orchestrator.js` records a timestamp before/after each pipeline
+  stage and logs a structured breakdown per request (`requestId`, per-stage
+  `ms`, `totalMs`, `cached`).
+- `backend/scripts/benchmark.js` — a manual dev script (not part of the app
+  or CI) that hits `POST /api/generate` N times against a couple of real
+  repos and reports p50/p95/p99 latency separately for cache-miss and
+  cache-hit paths.
 
-**Review checkpoint:** confirm rate limit trips correctly past threshold and
-resets on the expected window.
+**Review checkpoint:** run `benchmark.js` against a real repo — confirm
+cache-hit latency is milliseconds and cache-miss latency is dominated by the
+`llm` stage in the timing breakdown (i.e. the numbers tell the story you'd
+expect from the architecture, not something surprising).
 
 ---
 
-## Phase 11 — Frontend: Dashboard Shell
+## Phase 13 — Frontend: Dashboard Shell
 
 **Goal:** the input form and mode toggle, no API wiring yet (stub response).
 
@@ -280,10 +365,10 @@ submit logs the payload to console.
 
 ---
 
-## Phase 12 — Frontend: API Integration + State Machine
+## Phase 14 — Frontend: API Integration + State Machine
 
 **Goal:** real backend wiring with the "zero-willpower UI" states from
-`PROJECT.md` §12.
+`PROJECT.md` §16.
 
 - `client.js` calls the real `POST /api/generate`.
 - `Dashboard.jsx` tracks explicit states: `idle | loading | success | error`.
@@ -297,7 +382,7 @@ generation.
 
 ---
 
-## Phase 13 — Frontend: Markdown Rendering + Download
+## Phase 15 — Frontend: Markdown Rendering + Download
 
 **Goal:** display and export the generated output.
 
@@ -312,23 +397,49 @@ matches the markdown structure, copy/download both work.
 
 ---
 
-## Phase 14 — Polish & Deploy Readiness
+## Phase 16 — Frontend: Resilience
+
+**Goal:** handle the unexpected — crashes, hangs, and rate limits — per
+`PROJECT.md` §15.
+
+- `frontend/src/components/ErrorBoundary.jsx` — wraps `<Dashboard />` in
+  `App.jsx`, catches render-time exceptions, shows a fallback UI instead of
+  a blank screen.
+- `client.js` — `AbortController` with a client-side timeout; a timeout
+  produces its own distinct error state, not the generic upstream message.
+- `Dashboard.jsx` — the `error` state always renders a "Try again" action
+  that re-submits the same request.
+- `429` responses render distinctly from other errors, surfacing the
+  backend's `Retry-After`/reset info.
+- Loading state shows a "this can take up to ~X seconds" hint sourced from
+  Phase 12's real benchmark numbers, not a bare spinner.
+
+**Review checkpoint:** simulate each failure mode — throw inside a child
+component (confirm the boundary catches it), point `client.js` at a
+deliberately slow/unresponsive endpoint (confirm the abort timeout fires),
+and trigger a real `429` from Phase 3's rate limiter (confirm the
+`Retry-After` message renders correctly).
+
+---
+
+## Phase 17 — Polish & Deploy Readiness
 
 **Goal:** production hardening, not new features.
 
 - Env var validation on backend boot (fail fast if `GITHUB_TOKEN` /
-  `GOOGLE_API_KEY` / `MONGODB_URI` missing).
+  `GOOGLE_API_KEY` / `MONGODB_URI` missing) — extends Phase 2's process-level
+  safety nets to cover missing config, not just runtime errors.
+- `app.set('trust proxy', ...)` configured correctly for the deploy target
+  (flagged back in Phase 3).
 - CORS locked to the frontend's deployed origin.
 - Frontend production build (`vite build`) verified as a single static
   bundle; Tailwind purge confirmed.
-- Basic logging (request method/path/status/duration, plus pipeline stage
-  timings) on the backend.
 - Deployment docs: where backend + frontend + Mongo are hosted, and required
   env vars for each.
 
 **Review checkpoint:** full smoke test against a production-like build:
-generate in both modes, confirm caching, rate limiting, grounding drops, and
-error states all survive a prod build.
+generate in both modes, confirm caching, rate limiting, grounding drops,
+graceful shutdown, and all frontend error states survive a prod build.
 
 ---
 
@@ -339,3 +450,6 @@ error states all survive a prod build.
 - Multi-repo batch runs
 - Partial regeneration of a single markdown section
 - Second-pass LLM-based grounding verification (v1 is heuristic/lexical only)
+- Automated load testing (k6/autocannon) — the manual benchmark script
+  (Phase 12) is sufficient while the bottleneck is LLM latency, not
+  concurrency
