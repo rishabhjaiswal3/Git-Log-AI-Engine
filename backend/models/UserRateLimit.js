@@ -2,7 +2,7 @@ import mongoose from 'mongoose';
 
 const UserRateLimitSchema = new mongoose.Schema(
   {
-    userIpAddress: { type: String, required: true, index: true },
+    userIpAddress: { type: String, required: true, unique: true },
     requestCountWithinMonth: { type: Number, default: 1 },
     lastRequestTimestamp: { type: Date, default: Date.now },
   },
