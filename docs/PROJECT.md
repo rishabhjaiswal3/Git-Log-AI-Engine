@@ -194,7 +194,8 @@ GitLogAiEngine/
 │   │   ├── rateLimiter.js            # per-IP monthly cap (§13)
 │   │   └── errorHandler.js           # centralized Express error middleware (§12)
 │   ├── scripts/
-│   │   ├── verify-models.js          # throwaway DB verification (Phase 1)
+│   │   ├── verify-models.js          # DB model verification (Phase 1)
+│   │   ├── verify-rate-limit.js      # atomicity + monthly-reset verification (Phase 3)
 │   │   └── benchmark.js              # manual latency benchmark, cache-hit vs cache-miss (§14)
 │   ├── server.js
 │   ├── .env.example
@@ -289,7 +290,7 @@ export const ChangelogCache = mongoose.model('ChangelogCache', ChangelogCacheSch
 import mongoose from 'mongoose';
 
 const UserRateLimitSchema = new mongoose.Schema({
-  userIpAddress: { type: String, required: true, index: true },
+  userIpAddress: { type: String, required: true, unique: true }, // unique so concurrent upserts for a new IP can't create duplicate docs
   requestCountWithinMonth: { type: Number, default: 1 },
   lastRequestTimestamp: { type: Date, default: Date.now },
 }, { timestamps: true });

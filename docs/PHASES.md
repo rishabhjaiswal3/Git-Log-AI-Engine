@@ -10,7 +10,7 @@ import Octokit, LangChain, or Mongoose. Everything in `services/` and
 Keep that boundary honest phase by phase — it's what makes each phase
 independently testable.
 
-**Status:** Phases 0–2 complete. Phase 3 (Rate Limiting) is next.
+**Status:** Phases 0–3 complete. Phase 4 (GitHub Extraction Adapter) is next.
 
 ---
 
@@ -107,7 +107,7 @@ from day one instead of leaking raw library errors.
 
 ---
 
-## Phase 3 — Rate Limiting
+## Phase 3 — Rate Limiting ✅
 
 **Goal:** protect the pipeline from abuse. Moved ahead of the adapters/route
 work (it only depends on Phase 1's `UserRateLimit` model and Phase 2's
